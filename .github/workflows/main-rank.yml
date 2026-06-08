@@ -12,6 +12,7 @@ permissions:
 jobs:
   rank:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -19,145 +20,138 @@ jobs:
         with:
           node-version: 22
 
-      - name: Discover teams
-        id: teams
+      - name: Install bench (Playwright)
+        working-directory: bench
         run: |
-          TEAMS=$(ls -d participants/*/  2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
-          echo "teams=$TEAMS" >> "$GITHUB_OUTPUT"
-          echo "Discovered teams: $TEAMS"
+          npm install
+          npx playwright install chromium --with-deps
 
       - name: Bench all teams
         run: |
           mkdir -p results
           for TEAM_DIR in participants/*/; do
             TEAM=$(basename "$TEAM_DIR")
-            echo "========================================="
-            echo "Benchmarking: $TEAM"
-            echo "========================================="
+            [ ! -f "$TEAM_DIR/package.json" ] && continue
+
+            echo ""
+            echo "======================================="
+            echo "  Benchmarking: $TEAM"
+            echo "======================================="
 
             cd "$TEAM_DIR"
-            rm -f data.db data.db-journal data.db-wal
+            rm -f data.db data.db-*
 
-            npm install 2>&1 || { echo "{\"team\":\"$TEAM\",\"error\":\"npm install failed\"}" > "../../results/$TEAM.json"; cd ../..; continue; }
-            npm run build 2>&1 || { echo "{\"team\":\"$TEAM\",\"error\":\"npm run build failed\"}" > "../../results/$TEAM.json"; cd ../..; continue; }
-            npm start &
-            SERVER_PID=$!
-            sleep 5
-
-            HEALTHY=false
-            for i in $(seq 1 30); do
-              if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
-                HEALTHY=true
-                break
-              fi
-              sleep 1
-            done
-
-            if [ "$HEALTHY" = false ]; then
-              echo "{\"team\":\"$TEAM\",\"error\":\"server did not start\"}" > "../../results/$TEAM.json"
-              kill $SERVER_PID 2>/dev/null
+            if ! npm install 2>&1; then
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"npm install failed\"}" > "../../results/$TEAM.json"
               cd ../..
               continue
             fi
 
-            PASS=0
-            FAIL=0
+            if ! npm run build 2>&1; then
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"npm run build failed\"}" > "../../results/$TEAM.json"
+              cd ../..
+              continue
+            fi
 
-            # Basic tests
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/transactions \
-              -H "Content-Type: application/json" \
-              -d "{\"card_number\":\"4111111111111111\",\"holder_name\":\"Rank\",\"expiration\":\"12/28\",\"cvv\":\"123\",\"amount_cents\":10000,\"installments\":1,\"description\":\"Rank\",\"idempotency_key\":\"rank-$TEAM-001\"}")
-            [ "$CODE" = "201" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+            npm start &
+            SERVER_PID=$!
+            cd ../..
 
-            # Idempotency
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/transactions \
-              -H "Content-Type: application/json" \
-              -d "{\"card_number\":\"4111111111111111\",\"holder_name\":\"Rank\",\"expiration\":\"12/28\",\"cvv\":\"123\",\"amount_cents\":10000,\"installments\":1,\"description\":\"Rank\",\"idempotency_key\":\"rank-$TEAM-001\"}")
-            [ "$CODE" = "200" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+            READY=false
+            for i in $(seq 1 30); do
+              curl -sf http://localhost:3000/api/health > /dev/null 2>&1 && READY=true && break
+              sleep 1
+            done
 
-            # Declined
-            RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
-              -H "Content-Type: application/json" \
-              -d "{\"card_number\":\"9999111111111111\",\"holder_name\":\"Declined\",\"expiration\":\"12/28\",\"cvv\":\"123\",\"amount_cents\":10000,\"installments\":1,\"description\":\"Declined\",\"idempotency_key\":\"rank-$TEAM-002\"}")
-            echo "$RESP" | grep -q '"declined"' && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+            if [ "$READY" = false ]; then
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"server timeout\"}" > "results/$TEAM.json"
+              kill $SERVER_PID 2>/dev/null
+              continue
+            fi
 
-            # Balance
-            curl -sf http://localhost:3000/api/balance > /dev/null && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+            node bench/run.js || true
+            cp bench/results.json "results/$TEAM.json" 2>/dev/null || \
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"bench crashed\"}" > "results/$TEAM.json"
 
-            # Frontend
-            curl -sf http://localhost:3000/ > /dev/null && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
-
-            TOTAL=$((PASS+FAIL))
-
-            # Read info.json
-            INFO=$(cat info.json 2>/dev/null || echo '{}')
-
-            echo "{\"team\":\"$TEAM\",\"pass\":$PASS,\"fail\":$FAIL,\"total\":$TOTAL,\"info\":$INFO}" > "../../results/$TEAM.json"
+            # Inject team name
+            node -e "
+              const fs = require('fs');
+              const r = JSON.parse(fs.readFileSync('results/$TEAM.json','utf8'));
+              r.team = '$TEAM';
+              const info = JSON.parse(fs.readFileSync('$TEAM_DIR/info.json','utf8') || '{}');
+              r.info = info;
+              fs.writeFileSync('results/$TEAM.json', JSON.stringify(r, null, 2));
+            " 2>/dev/null || true
 
             kill $SERVER_PID 2>/dev/null
-            wait $SERVER_PID 2>/dev/null
-            cd ../..
+            wait $SERVER_PID 2>/dev/null || true
+            sleep 1
           done
 
-      - name: Generate LEADERBOARD.md
+      - name: Generate leaderboard
         run: |
           node -e "
             const fs = require('fs');
             const files = fs.readdirSync('results').filter(f => f.endsWith('.json'));
             const teams = files.map(f => JSON.parse(fs.readFileSync('results/' + f, 'utf8')));
-            teams.sort((a, b) => (b.pass || 0) - (a.pass || 0));
+            teams.sort((a, b) => (b.summary?.pass || 0) - (a.summary?.pass || 0));
+            const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-            let md = '# Leaderboard -- Rinha FullStack SENAI 2026\n\n';
-            md += 'Atualizado em: ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC\n\n';
-            md += '| # | Time | Testes | Status |\n';
-            md += '|---|------|--------|--------|\n';
+            // LEADERBOARD.md
+            let lb = '# 🏆 Leaderboard -- Rinha FullStack SENAI 2026\n\n';
+            lb += '> Atualizado em: ' + now + ' UTC\n\n';
+            lb += '| # | Time | Testes | Status |\n';
+            lb += '|---|------|--------|--------|\n';
             teams.forEach((t, i) => {
-              if (t.error) {
-                md += '| ' + (i+1) + ' | ' + t.team + ' | - | ' + t.error + ' |\n';
-              } else {
-                md += '| ' + (i+1) + ' | ' + t.team + ' | ' + t.pass + '/' + t.total + ' | OK |\n';
-              }
+              const s = t.summary || {};
+              const icon = t.error ? '❌' : s.fail === 0 ? '✅' : '⚠️';
+              const score = t.error ? '-' : s.pass + '/' + s.total;
+              const status = t.error || (s.fail === 0 ? 'Perfeito' : s.fail + ' falha(s)');
+              lb += '| ' + (i+1) + ' | ' + (t.team||t.info?.team||'?') + ' | ' + score + ' | ' + icon + ' ' + status + ' |\n';
             });
-            md += '\nResultado completo: [RESULTS.md](./RESULTS.md)\n';
-            fs.writeFileSync('LEADERBOARD.md', md);
-            console.log('LEADERBOARD.md gerado');
-          "
+            lb += '\n📋 [Resultado completo](./RESULTS.md)\n';
+            fs.writeFileSync('LEADERBOARD.md', lb);
 
-      - name: Generate RESULTS.md
-        run: |
-          node -e "
-            const fs = require('fs');
-            const files = fs.readdirSync('results').filter(f => f.endsWith('.json'));
-            const teams = files.map(f => JSON.parse(fs.readFileSync('results/' + f, 'utf8')));
-            teams.sort((a, b) => (b.pass || 0) - (a.pass || 0));
-
-            let md = '# Resultados Completos -- Rinha FullStack SENAI 2026\n\n';
-            md += 'Atualizado em: ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC\n';
-            md += 'Total de times: ' + teams.length + '\n\n';
+            // RESULTS.md
+            let md = '# 📊 Resultados Completos -- Rinha FullStack SENAI 2026\n\n';
+            md += '> Atualizado em: ' + now + ' UTC  \n';
+            md += '> Total de times: ' + teams.length + '\n\n';
             md += '| # | Time | Testes | Status |\n';
             md += '|---|------|--------|--------|\n';
             teams.forEach((t, i) => {
-              if (t.error) {
-                md += '| ' + (i+1) + ' | ' + t.team + ' | - | ' + t.error + ' |\n';
-              } else {
-                md += '| ' + (i+1) + ' | ' + t.team + ' | ' + t.pass + '/' + t.total + ' | OK |\n';
-              }
+              const s = t.summary || {};
+              const score = t.error ? '-' : s.pass + '/' + s.total;
+              md += '| ' + (i+1) + ' | ' + (t.team||'?') + ' | ' + score + ' | ' + (t.error || 'OK') + ' |\n';
             });
             md += '\n---\n\n';
             teams.forEach(t => {
               const info = t.info || {};
               const members = (info.members || []).map(m => m.name + ' (' + m.github + ')').join(', ');
-              md += '<details>\n<summary>' + t.team + ' -- ' + (t.error ? 'ERRO' : t.pass + '/' + t.total) + '</summary>\n\n';
-              if (members) md += '- Membros: ' + members + '\n';
-              if (t.error) md += '- Erro: ' + t.error + '\n';
-              else md += '- Testes: ' + t.pass + '/' + t.total + ' passando\n';
-              md += '\n</details>\n\n';
+              const s = t.summary || {};
+              md += '<details>\n<summary><strong>' + (t.team||'?') + '</strong> -- ' + (t.error ? '❌ ERRO' : '✅ ' + s.pass + '/' + s.total) + '</summary>\n\n';
+              if (members) md += '**Membros:** ' + members + '\n\n';
+              if (t.error) { md += '**Erro:** ' + t.error + '\n'; }
+              else {
+                ['rules','frontend','stress'].forEach(cat => {
+                  const items = t[cat] || [];
+                  if (items.length === 0) return;
+                  const title = {rules:'Regras de negocio',frontend:'Frontend (Playwright)',stress:'Stress test'}[cat];
+                  md += '**' + title + ':**\n';
+                  items.forEach(i => {
+                    md += '- ' + (i.ok ? '✅' : '❌') + ' ' + i.name;
+                    if (i.detail) md += ' *(' + i.detail + ')*';
+                    md += '\n';
+                  });
+                  md += '\n';
+                });
+              }
+              md += '</details>\n\n';
             });
             fs.writeFileSync('RESULTS.md', md);
-            console.log('RESULTS.md gerado');
+            console.log('Leaderboard e resultados gerados');
           "
 
-      - name: Commit results
+      - name: Commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

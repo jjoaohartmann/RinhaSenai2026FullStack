@@ -1,0 +1,11 @@
+{
+  "name": "rinha-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}

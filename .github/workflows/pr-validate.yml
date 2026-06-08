@@ -20,117 +20,70 @@ jobs:
         with:
           node-version: 22
 
-      - name: Detect team folders
+      - name: Detect team
         id: team
         run: |
-          FOLDERS=$(git diff --name-only origin/main...HEAD | grep '^participants/' | cut -d'/' -f2 | sort -u || true)
-          COUNT=$(echo "$FOLDERS" | grep -c . || true)
-
-          if [ "$COUNT" -eq 0 ]; then
-            echo "Nenhuma pasta de participante alterada -- pulando validacao de time"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$COUNT" -gt 1 ]; then
-            echo "::warning::PR altera mais de uma pasta de participante: $FOLDERS"
-          fi
-
-          TEAM=$(echo "$FOLDERS" | head -1)
-          echo "team=$TEAM" >> "$GITHUB_OUTPUT"
-          echo "dir=participants/$TEAM" >> "$GITHUB_OUTPUT"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "Team detectado: $TEAM"
+          for dir in participants/*/; do
+            if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+              TEAM=$(basename "$dir")
+              echo "team=$TEAM" >> "$GITHUB_OUTPUT"
+              echo "dir=participants/$TEAM" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "Team: $TEAM"
+              exit 0
+            fi
+          done
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "Nenhum participante encontrado"
 
       - name: Validate info.json
         if: steps.team.outputs.skip != 'true'
         run: |
           TEAM="${{ steps.team.outputs.team }}"
           DIR="${{ steps.team.outputs.dir }}"
-          if [ ! -f "$DIR/info.json" ]; then
-            echo "::error::info.json nao encontrado em $DIR/"
-            exit 1
-          fi
           node -e "
-            const info = require('./$DIR/info.json');
-            if (info.team !== '$TEAM') {
-              console.error('team no info.json ('+info.team+') nao bate com a pasta ($TEAM)');
-              process.exit(1);
-            }
-            if (!Array.isArray(info.members) || info.members.length < 1) {
-              console.error('members deve ter pelo menos 1 membro');
-              process.exit(1);
-            }
-            for (const m of info.members) {
-              if (!m.name || !m.github || !m.github.startsWith('@')) {
-                console.error('Membro invalido: ' + JSON.stringify(m));
-                process.exit(1);
-              }
-            }
-            console.log('info.json valido: team=' + info.team + ', ' + info.members.length + ' membros');
+            const fs = require('fs');
+            const info = JSON.parse(fs.readFileSync('$DIR/info.json', 'utf8'));
+            const errors = [];
+            if (info.team !== '$TEAM') errors.push('team nao bate com pasta');
+            if (!Array.isArray(info.members) || info.members.length < 1) errors.push('members vazio');
+            (info.members || []).forEach(m => {
+              if (!m.name || !m.github?.startsWith('@')) errors.push('membro invalido: ' + JSON.stringify(m));
+            });
+            if (errors.length) { errors.forEach(e => console.error(e)); process.exit(1); }
+            console.log('info.json OK: team=' + info.team + ', ' + info.members.length + ' membros');
           "
 
       - name: Validate package.json
         if: steps.team.outputs.skip != 'true'
         run: |
-          DIR="${{ steps.team.outputs.dir }}"
-          if [ ! -f "$DIR/package.json" ]; then
-            echo "::error::package.json nao encontrado em $DIR/"
-            exit 1
-          fi
           node -e "
-            const pkg = require('./$DIR/package.json');
-            if (!pkg.scripts?.build) { console.error('script build faltando'); process.exit(1); }
-            if (!pkg.scripts?.start) { console.error('script start faltando'); process.exit(1); }
-            console.log('package.json valido');
+            const pkg = require('./${{ steps.team.outputs.dir }}/package.json');
+            if (!pkg.scripts?.build || !pkg.scripts?.start) { console.error('scripts build/start faltando'); process.exit(1); }
+            console.log('package.json OK');
           "
 
-      - name: Check no node_modules or db files
+      - name: Check forbidden files
         run: |
-          BAD=$(git diff --name-only origin/main...HEAD | grep -E '(node_modules/|\.db$)' || true)
+          BAD=$(git diff --name-only origin/main...HEAD 2>/dev/null | grep -E '(node_modules/|\.db$)' || true)
           if [ -n "$BAD" ]; then
-            echo "::error::Arquivos proibidos no PR: $BAD"
+            echo "::error::Arquivos proibidos: $BAD"
             exit 1
           fi
 
-      - name: Install dependencies
+      - name: Install + Build + Start + Health
         if: steps.team.outputs.skip != 'true'
         working-directory: ${{ steps.team.outputs.dir }}
-        run: npm install
-        timeout-minutes: 2
-
-      - name: Build frontend
-        if: steps.team.outputs.skip != 'true'
-        working-directory: ${{ steps.team.outputs.dir }}
-        run: npm run build
-        timeout-minutes: 1
-
-      - name: Start server and health check
-        if: steps.team.outputs.skip != 'true'
-        working-directory: ${{ steps.team.outputs.dir }}
+        timeout-minutes: 3
         run: |
+          npm install
+          npm run build
           npm start &
-          SERVER_PID=$!
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
-              echo "Server healthy after ${i}s"
-              break
-            fi
-            if [ $i -eq 30 ]; then
-              echo "::error::Server nao respondeu em 30s"
-              kill $SERVER_PID 2>/dev/null
-              exit 1
-            fi
+            curl -sf http://localhost:3000/api/health > /dev/null 2>&1 && break
+            [ $i -eq 30 ] && echo "::error::Server timeout" && exit 1
             sleep 1
           done
-
-          # Check frontend is served
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
-          if [ "$STATUS" != "200" ]; then
-            echo "::error::Frontend nao servido (HTTP $STATUS)"
-            kill $SERVER_PID 2>/dev/null
-            exit 1
-          fi
-
-          echo "Validacao completa!"
-          kill $SERVER_PID 2>/dev/null
+          curl -sf http://localhost:3000/ > /dev/null || (echo "::error::Frontend nao servido" && exit 1)
+          echo "Validacao OK"
+          kill %1 2>/dev/null || true
